@@ -506,7 +506,7 @@
 
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-import { getFirestore, doc, getDoc, setDoc, onSnapshot, collection } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import { getFirestore, doc, updateDoc, onSnapshot, setDoc, getDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
 // ---- FIREBASE CONFIG ----
 const firebaseConfig = {
@@ -519,22 +519,21 @@ const firebaseConfig = {
 };
 const firebaseApp = initializeApp(firebaseConfig);
 const db = getFirestore(firebaseApp);
-const FIRESTORE_DOC = "planner/tasks";
+const PLANNER_REF = () => doc(db, "planner", "tasks");
 
 // ---- SYNC STATE ----
-let isSyncing = false;
-let pendingSave = null;
 let isOnline = navigator.onLine;
+let unsubscribeSnapshot = null; // holds the onSnapshot listener
+let ignoreNextSnapshot = false; // prevent echo after our own write
 
 function setSyncStatus(status) {
-  // status: 'synced' | 'saving' | 'offline' | 'error'
   const chip = document.getElementById('syncChip');
   if (!chip) return;
   const map = {
-    synced:  { text: '☁ Synced',   color: 'var(--accent2)' },
-    saving:  { text: '↑ Saving…',  color: 'var(--accent)'  },
-    offline: { text: '⚡ Offline',  color: '#f59e0b'        },
-    error:   { text: '⚠ Sync error', color: 'var(--danger)' },
+    synced:  { text: '☁ Synced',     color: 'var(--accent2)' },
+    saving:  { text: '↑ Saving…',    color: 'var(--accent)'  },
+    offline: { text: '⚡ Offline',    color: '#f59e0b'        },
+    error:   { text: '⚠ Sync error', color: 'var(--danger)'  },
   };
   const s = map[status] || map.synced;
   chip.textContent = s.text;
@@ -542,19 +541,47 @@ function setSyncStatus(status) {
   chip.style.borderColor = s.color;
 }
 
-window.addEventListener('online',  () => { isOnline = true;  setSyncStatus('synced');  loadFromFirestore().then(render); });
-window.addEventListener('offline', () => { isOnline = false; setSyncStatus('offline'); });
+window.addEventListener('online',  () => {
+  isOnline = true;
+  setSyncStatus('synced');
+  startSnapshot(); // reconnect listener
+});
+window.addEventListener('offline', () => {
+  isOnline = false;
+  setSyncStatus('offline');
+  if (unsubscribeSnapshot) { unsubscribeSnapshot(); unsubscribeSnapshot = null; }
+});
 
-// ---- FIRESTORE LOAD / SAVE ----
+// ---- STRIP / RESTORE empty tasks ----
+// Before saving: remove rows that are blank and not done (saves bandwidth)
+function stripEmpty(tasks) {
+  return (tasks || []).filter(t => t.text.trim() !== '' || t.done);
+}
+// After loading: re-pad to DEFAULT_TASKS minimum
+function padTasks(tasks) {
+  const arr = (tasks || []).map(t => ({ text: t.text || '', done: !!t.done }));
+  while (arr.length < DEFAULT_TASKS) arr.push({ text: '', done: false });
+  return arr;
+}
+
+// ---- LOCAL STORAGE (cache + offline fallback) ----
+const STORAGE_KEY = 'dailyplanner_v2';
+function loadLocalData() {
+  try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {}; } catch { return {}; }
+}
+function saveLocalData(data) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch(e) {}
+}
+
+// ---- FIRESTORE: initial load ----
 async function loadFromFirestore() {
   if (!isOnline) return;
   try {
-    const ref = doc(db, "planner", "tasks");
-    const snap = await getDoc(ref);
+    const snap = await getDoc(PLANNER_REF());
     if (snap.exists()) {
       const remote = snap.data().tasks || {};
-      // Merge: remote wins, but keep local keys not yet in remote
       const local = loadLocalData();
+      // Merge: remote wins per key
       const merged = Object.assign({}, local, remote);
       saveLocalData(merged);
     }
@@ -564,52 +591,81 @@ async function loadFromFirestore() {
   }
 }
 
-async function saveToFirestore(data) {
+// ---- FIRESTORE: per-date save (optimization #1) ----
+// Only sends the changed dateKey field, not the whole object
+const saveTimers = {}; // one debounce timer per dateKey
+async function saveDateToFirestore(dateKey, tasks) {
   if (!isOnline) { setSyncStatus('offline'); return; }
-  if (isSyncing) { pendingSave = data; return; }
-  isSyncing = true;
   setSyncStatus('saving');
   try {
-    const ref = doc(db, "planner", "tasks");
-    await setDoc(ref, { tasks: data });
+    const stripped = stripEmpty(tasks); // optimization #2: strip empty rows
+    const ref = PLANNER_REF();
+    // Use setDoc with merge so other dates are untouched
+    ignoreNextSnapshot = true;
+    await setDoc(ref, { tasks: { [dateKey]: stripped } }, { merge: true });
     setSyncStatus('synced');
   } catch(e) {
+    // If doc doesn't exist yet, setDoc with merge creates it — so this is safe
     console.warn('Firestore save error:', e);
     setSyncStatus('error');
-  } finally {
-    isSyncing = false;
-    if (pendingSave) {
-      const next = pendingSave;
-      pendingSave = null;
-      saveToFirestore(next);
-    }
   }
 }
 
-// Debounce saves so rapid typing doesn't spam Firestore
-let saveTimer = null;
-function debouncedSave(data) {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => saveToFirestore(data), 1200);
+function debouncedSaveDate(dateKey, tasks) {
+  clearTimeout(saveTimers[dateKey]);
+  saveTimers[dateKey] = setTimeout(() => saveDateToFirestore(dateKey, tasks), 1200);
 }
 
-// ---- LOCAL STORAGE (fallback / cache) ----
-const STORAGE_KEY = 'dailyplanner_v2';
-function loadLocalData() {
-  try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {}; } catch { return {}; }
-}
-function saveLocalData(data) {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch(e) {}
+// ---- FIRESTORE: onSnapshot live listener (optimization #3) ----
+function startSnapshot() {
+  if (unsubscribeSnapshot) unsubscribeSnapshot(); // clear old listener first
+  if (!isOnline) return;
+  try {
+    unsubscribeSnapshot = onSnapshot(PLANNER_REF(), (snap) => {
+      if (ignoreNextSnapshot) { ignoreNextSnapshot = false; return; }
+      if (!snap.exists()) return;
+      const remote = snap.data().tasks || {};
+      const local = loadLocalData();
+      // Merge remote into local, remote wins per dateKey
+      let changed = false;
+      for (const [key, val] of Object.entries(remote)) {
+        const localStr = JSON.stringify(local[key] || []);
+        const remoteStr = JSON.stringify(val);
+        if (localStr !== remoteStr) { local[key] = val; changed = true; }
+      }
+      if (changed) {
+        saveLocalData(local);
+        render(); // re-render with fresh data
+        showToast('📡 Synced from another device');
+      }
+    }, (err) => {
+      console.warn('Snapshot error:', err);
+      setSyncStatus('error');
+    });
+  } catch(e) {
+    console.warn('startSnapshot error:', e);
+  }
 }
 
-// ---- UNIFIED STORAGE API (used everywhere in app) ----
+// ---- UNIFIED STORAGE API ----
 function loadData() {
-  return loadLocalData(); // always read from local cache (fast, sync)
+  return loadLocalData(); // always read from local cache (instant, sync)
 }
+
+// saveData(data) — saves full object locally + debounce-saves each dirty date
+// Called by render() on initial load (bulk) and by interactions (single date)
 function saveData(data) {
-  saveLocalData(data);      // save locally immediately
-  debouncedSave(data);      // push to Firestore async
+  saveLocalData(data);
 }
+
+// saveDate(dateKey, tasks) — called on every user interaction with a specific date
+function saveDate(dateKey, tasks) {
+  const data = loadLocalData();
+  data[dateKey] = tasks;
+  saveLocalData(data);
+  debouncedSaveDate(dateKey, tasks);
+}
+
 function getDateKey(y, m, d) { return `${y}-${String(m+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`; }
 
 const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
@@ -734,7 +790,7 @@ function render() {
     renderTasks(dateKey, tasks, locked);
   }
 
-  saveData(data);
+  saveLocalData(data); // persist padded structure locally only, no Firestore push
   bindTileActions();
   updatePasteBtns();
   updateLockChip();
@@ -762,7 +818,7 @@ function renderTasks(dateKey, tasks, locked) {
       const d = loadData();
       pushHistory(key, d[key]);
       d[key][idx].done = e.target.checked;
-      saveData(d);
+      saveDate(key, d[key]);
       const row = e.target.closest('.task-row');
       if (e.target.checked) row.classList.add('done'); else row.classList.remove('done');
       updateHistoryBtn(key);
@@ -782,7 +838,7 @@ function renderTasks(dateKey, tasks, locked) {
       const idx = +e.target.dataset.idx;
       const d = loadData();
       d[key][idx].text = e.target.value;
-      saveData(d);
+      saveDate(key, d[key]);
       // Debounce history push so rapid typing = 1 history entry
       if (debounceTimer) clearTimeout(debounceTimer);
       debounceTimer = setTimeout(() => {
@@ -801,7 +857,7 @@ function renderTasks(dateKey, tasks, locked) {
       const d = loadData();
       pushHistory(key, d[key]);
       d[key].splice(idx + 1, 0, {text:'', done:false});
-      saveData(d);
+      saveDate(key, d[key]);
       renderTasks(key, d[key], false);
       setTimeout(() => {
         const c = document.getElementById(`tasks-${key}`);
@@ -820,7 +876,7 @@ function renderTasks(dateKey, tasks, locked) {
       const d = loadData();
       pushHistory(key, d[key]);
       d[key].splice(idx, 1);
-      saveData(d);
+      saveDate(key, d[key]);
       renderTasks(key, d[key], false);
     });
   });
@@ -843,7 +899,7 @@ function bindTileActions() {
       pushHistory(key, d[key] || []);
       d[key] = d[key] || [];
       d[key].push({text:'', done:false});
-      saveData(d);
+      saveDate(key, d[key]);
       renderTasks(key, d[key], false);
       setTimeout(() => {
         const c = document.getElementById(`tasks-${key}`);
@@ -891,7 +947,7 @@ function bindTileActions() {
       pushHistory(key, prev);
       lastPasteTarget = { dateKey: key, prevTasks: prev };
       d[key] = JSON.parse(JSON.stringify(copiedData.tasks));
-      saveData(d);
+      saveDate(key, d[key]);
       const locked = isPast(...key.split('-').map(Number).map((v,i)=>i===1?v-1:v)) && !globalUnlocked;
       renderTasks(key, d[key], locked);
       showToast('Tasks pasted!');
@@ -906,7 +962,7 @@ function bindTileActions() {
       const { dateKey, prevTasks } = lastPasteTarget;
       const d = loadData();
       d[dateKey] = prevTasks;
-      saveData(d);
+      saveDate(dateKey, d[dateKey]);
       const parts = dateKey.split('-').map(Number);
       const locked = isPast(parts[0], parts[1]-1, parts[2]) && !globalUnlocked;
       renderTasks(dateKey, d[dateKey], locked);
@@ -924,7 +980,7 @@ function bindTileActions() {
       if (!snap) return;
       const d = loadData();
       d[key] = snap;
-      saveData(d);
+      saveDate(key, d[key]);
       const parts = key.split('-').map(Number);
       const locked = isPast(parts[0], parts[1]-1, parts[2]) && !globalUnlocked;
       renderTasks(key, d[key], locked);
@@ -1060,11 +1116,12 @@ document.getElementById('nextBtn2').addEventListener('click', () => changeMonth(
 const savedTheme = localStorage.getItem('planner_theme');
 if (savedTheme === 'dark') applyTheme(true);
 
-// Load from Firestore first, then render
+// Initial load: fetch from Firestore once, render, then start live listener
 setSyncStatus(isOnline ? 'saving' : 'offline');
 loadFromFirestore().then(() => {
   render();
   setSyncStatus(isOnline ? 'synced' : 'offline');
+  startSnapshot(); // optimization #3: live sync via onSnapshot
 });
 </script>
 </body>
