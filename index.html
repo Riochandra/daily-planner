@@ -448,6 +448,100 @@
     white-space: nowrap;
   }
   .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+  /* ---- JUMP TO DATE ---- */
+  .jump-wrap {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--surface2);
+    border: 1.5px solid var(--border);
+    border-radius: 10px;
+    padding: 4px 10px 4px 12px;
+    transition: border-color var(--transition);
+  }
+  .jump-wrap:focus-within { border-color: var(--accent); }
+  .jump-label {
+    font-size: 0.78rem;
+    font-weight: 500;
+    color: var(--text2);
+    white-space: nowrap;
+  }
+  .jump-input {
+    font-family: 'DM Sans', sans-serif;
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: var(--text);
+    background: transparent;
+    border: none;
+    outline: none;
+    width: 36px;
+    text-align: center;
+  }
+  .jump-input::placeholder { color: var(--text2); opacity: 0.5; font-weight: 400; }
+  .jump-go {
+    font-family: 'DM Sans', sans-serif;
+    font-size: 0.78rem;
+    font-weight: 600;
+    padding: 3px 10px;
+    border-radius: 7px;
+    border: none;
+    background: var(--accent);
+    color: #fff;
+    cursor: pointer;
+    transition: opacity var(--transition);
+  }
+  .jump-go:hover { opacity: 0.85; }
+
+  /* ---- FLOATING BUTTONS ---- */
+  .fab-group {
+    position: fixed;
+    bottom: 88px;
+    right: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    z-index: 200;
+  }
+  .fab {
+    width: 46px; height: 46px;
+    border-radius: 50%;
+    border: none;
+    background: var(--accent);
+    color: #fff;
+    font-size: 1.1rem;
+    cursor: pointer;
+    box-shadow: 0 4px 18px rgba(79,110,247,0.35);
+    display: flex; align-items: center; justify-content: center;
+    transition: transform var(--transition), box-shadow var(--transition), background var(--transition);
+  }
+  .fab:hover { transform: scale(1.1); box-shadow: 0 6px 24px rgba(79,110,247,0.45); }
+  .fab.fab-today { background: var(--accent2); box-shadow: 0 4px 18px rgba(34,211,165,0.35); }
+  .fab.fab-today:hover { box-shadow: 0 6px 24px rgba(34,211,165,0.5); }
+  .fab-tooltip {
+    position: absolute;
+    right: 54px;
+    background: var(--text);
+    color: var(--surface);
+    font-size: 0.75rem;
+    font-weight: 500;
+    padding: 4px 10px;
+    border-radius: 6px;
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
+    transform: translateX(6px);
+    transition: all 0.18s ease;
+  }
+  .fab:hover .fab-tooltip { opacity: 1; transform: translateX(0); }
+
+  /* highlight pulse on jumped-to card */
+  @keyframes jumpPulse {
+    0%   { box-shadow: 0 0 0 0 rgba(79,110,247,0.5); border-color: var(--accent); }
+    60%  { box-shadow: 0 0 0 10px rgba(79,110,247,0); }
+    100% { box-shadow: var(--shadow); }
+  }
+  .jump-highlight { animation: jumpPulse 0.9s ease forwards !important; }
 </style>
 </head>
 <body>
@@ -460,6 +554,11 @@
     <select id="monthSel"></select>
     <select id="yearSel"></select>
     <button class="nav-btn" id="nextBtn">Next →</button>
+    <div class="jump-wrap" title="Jump to day">
+      <span class="jump-label">Day</span>
+      <input class="jump-input" id="jumpInput" type="number" min="1" max="31" placeholder="—">
+      <button class="jump-go" id="jumpGo">Go</button>
+    </div>
   </div>
   <div class="nav-spacer"></div>
   <div class="nav-right">
@@ -498,6 +597,22 @@
     <button class="popup-close" id="popupClose">×</button>
     <div class="popup-title" id="popupTitle"></div>
     <div id="popupBody"></div>
+  </div>
+</div>
+
+<!-- FLOATING BUTTONS -->
+<div class="fab-group">
+  <div style="position:relative">
+    <button class="fab fab-today" id="fabToday" title="Jump to today">
+      <span class="fab-tooltip">Jump to today</span>
+      ◎
+    </button>
+  </div>
+  <div style="position:relative">
+    <button class="fab" id="fabTop" title="Back to top">
+      <span class="fab-tooltip">Back to top</span>
+      ↑
+    </button>
   </div>
 </div>
 
@@ -1106,12 +1221,60 @@ function showToast(msg) {
   setTimeout(() => t.classList.remove('show'), 2800);
 }
 
+// ---- JUMP TO DATE ----
+function jumpToDay(day) {
+  const daysInMonth = new Date(currentYear, currentMonth + 1, 0).getDate();
+  const d = Math.min(Math.max(parseInt(day), 1), daysInMonth);
+  if (isNaN(d)) return;
+  const dateKey = getDateKey(currentYear, currentMonth, d);
+  const tile = document.querySelector(`.day-tile[data-datekey="${dateKey}"]`);
+  if (!tile) return;
+  tile.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  // pulse highlight
+  tile.classList.remove('jump-highlight');
+  void tile.offsetWidth; // reflow to restart animation
+  tile.classList.add('jump-highlight');
+  setTimeout(() => tile.classList.remove('jump-highlight'), 1000);
+  document.getElementById('jumpInput').value = '';
+}
+
+function jumpToToday() {
+  // If not on current month/year, navigate there first
+  const todayMonth = now.getMonth();
+  const todayYear = now.getFullYear();
+  if (currentMonth !== todayMonth || currentYear !== todayYear) {
+    currentMonth = todayMonth;
+    currentYear = todayYear;
+    document.getElementById('monthSel').value = currentMonth;
+    document.getElementById('yearSel').value = currentYear;
+    render();
+    // Wait for render then scroll
+    setTimeout(() => jumpToDay(now.getDate()), 120);
+  } else {
+    jumpToDay(now.getDate());
+  }
+}
+
 // ---- INIT ----
 setupNav();
 document.getElementById('prevBtn').addEventListener('click', () => changeMonth(-1));
 document.getElementById('nextBtn').addEventListener('click', () => changeMonth(1));
 document.getElementById('prevBtn2').addEventListener('click', () => changeMonth(-1));
 document.getElementById('nextBtn2').addEventListener('click', () => changeMonth(1));
+
+// Jump to date
+document.getElementById('jumpGo').addEventListener('click', () => {
+  jumpToDay(document.getElementById('jumpInput').value);
+});
+document.getElementById('jumpInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') jumpToDay(e.target.value);
+});
+
+// FABs
+document.getElementById('fabToday').addEventListener('click', jumpToToday);
+document.getElementById('fabTop').addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
 
 const savedTheme = localStorage.getItem('planner_theme');
 if (savedTheme === 'dark') applyTheme(true);
@@ -1121,7 +1284,7 @@ setSyncStatus(isOnline ? 'saving' : 'offline');
 loadFromFirestore().then(() => {
   render();
   setSyncStatus(isOnline ? 'synced' : 'offline');
-  startSnapshot(); // optimization #3: live sync via onSnapshot
+  startSnapshot();
 });
 </script>
 </body>
