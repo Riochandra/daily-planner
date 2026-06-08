@@ -542,6 +542,19 @@
     100% { box-shadow: var(--shadow); }
   }
   .jump-highlight { animation: jumpPulse 0.9s ease forwards !important; }
+  /* ---- SELECT MODE ---- */
+  .task-row.selectable { cursor: pointer; user-select: none; }
+  .task-row.selectable:hover { background: var(--accent-light); border-radius: 8px; }
+  .task-row.selected { background: var(--accent-light); border-radius: 8px; outline: 1.5px solid var(--accent); }
+  .task-row.selected .select-indicator { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .select-indicator { display: none; width: 18px; height: 18px; border-radius: 50%; border: 1.5px solid var(--border); background: var(--surface2); flex-shrink: 0; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; transition: all var(--transition); }
+  .select-mode .select-indicator { display: flex; }
+  .select-mode input[type="checkbox"] { display: none; }
+  .action-btn.select-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .action-btn.copy-selected-btn { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .action-btn.copy-selected-btn:hover { opacity: 0.85; }
+  .action-btn.append-paste-btn { background: var(--accent-light); border-color: var(--accent); color: var(--accent); }
+  .action-btn.append-paste-btn:hover { background: var(--accent); color: #fff; }
 </style>
 </head>
 <body>
@@ -793,6 +806,9 @@ let currentYear = now.getFullYear();
 let globalUnlocked = false;
 let copiedData = null;
 let lastPasteTarget = null;
+let selectModeKey = null;       // dateKey of card currently in select mode
+let selectedIndices = new Set(); // indices of selected tasks
+let copiedSelected = null;       // {tasks:[]} from select-copy
 
 // ---- HISTORY STACK (per dateKey, max 20 steps) ----
 const history = {};
@@ -895,8 +911,12 @@ function render() {
       <div class="tile-actions">
         ${!locked ? `<button class="action-btn add-btn" data-key="${dateKey}">＋ Add Task</button>` : ''}
         <button class="action-btn viewall-btn" data-key="${dateKey}">👁 View All</button>
-        <button class="action-btn copy-btn" data-key="${dateKey}" title="Copy all tasks">⎘ Copy</button>
+        <button class="action-btn select-btn" data-key="${dateKey}">☑ Select</button>
+        <button class="action-btn copy-selected-btn" data-key="${dateKey}" style="display:none">⎘ Copy Selected (<span class="sel-count">0</span>)</button>
+        <button class="action-btn cancel-select-btn" data-key="${dateKey}" style="display:none">✕ Cancel</button>
+        <button class="action-btn copy-btn" data-key="${dateKey}" title="Copy all tasks">⎘ Copy All</button>
         <button class="action-btn paste-btn" data-key="${dateKey}" title="Paste tasks" style="display:none">📋 Paste</button>
+        <button class="action-btn append-paste-btn" data-key="${dateKey}" title="Append selected tasks" style="display:none">📋 Append</button>
         <button class="action-btn undo-btn" data-key="${dateKey}" title="Undo paste" style="display:none">↩ Undo</button>
         ${!locked ? `<button class="action-btn history-undo-btn" data-key="${dateKey}" style="display:none">↩ Undo (0)</button>` : ''}
       </div>
@@ -919,6 +939,7 @@ function renderTasks(dateKey, tasks, locked) {
     const row = document.createElement('div');
     row.className = 'task-row' + (t.done ? ' done' : '');
     row.innerHTML = `
+      <span class="select-indicator">✓</span>
       <input type="checkbox" ${t.done ? 'checked' : ''} ${locked ? 'disabled' : ''} data-key="${dateKey}" data-idx="${i}">
       <input type="text" placeholder="Task..." value="${escapeAttr(t.text)}" ${locked ? 'disabled' : ''} data-key="${dateKey}" data-idx="${i}">
       ${!locked ? `<button class="insert-btn" data-key="${dateKey}" data-idx="${i}" title="Insert row below">+</button><button class="remove-btn" data-key="${dateKey}" data-idx="${i}" title="Remove">×</button>` : ''}
@@ -1005,7 +1026,124 @@ function escapeAttr(s) {
   return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
+function enterSelectMode(dateKey) {
+  // Exit any existing select mode first
+  if (selectModeKey) exitSelectMode(selectModeKey);
+  selectModeKey = dateKey;
+  selectedIndices = new Set();
+  const tasksEl = document.getElementById(`tasks-${dateKey}`);
+  if (!tasksEl) return;
+  tasksEl.classList.add('select-mode');
+  tasksEl.querySelectorAll('.task-row').forEach((row, i) => {
+    row.classList.add('selectable');
+    row.dataset.selIdx = i;
+    row.addEventListener('click', onSelectRowClick);
+  });
+  // Show/hide buttons
+  const tile = document.querySelector(`.day-tile[data-datekey="${dateKey}"]`);
+  if (!tile) return;
+  tile.querySelector('.select-btn').classList.add('active');
+  tile.querySelector('.select-btn').textContent = '☑ Selecting…';
+  tile.querySelector('.copy-selected-btn').style.display = '';
+  tile.querySelector('.cancel-select-btn').style.display = '';
+  updateSelCount(dateKey);
+}
+
+function exitSelectMode(dateKey) {
+  if (selectModeKey !== dateKey) return;
+  selectModeKey = null;
+  selectedIndices = new Set();
+  const tasksEl = document.getElementById(`tasks-${dateKey}`);
+  if (tasksEl) {
+    tasksEl.classList.remove('select-mode');
+    tasksEl.querySelectorAll('.task-row').forEach(row => {
+      row.classList.remove('selectable', 'selected');
+      row.removeEventListener('click', onSelectRowClick);
+    });
+  }
+  const tile = document.querySelector(`.day-tile[data-datekey="${dateKey}"]`);
+  if (!tile) return;
+  const selectBtn = tile.querySelector('.select-btn');
+  selectBtn.classList.remove('active');
+  selectBtn.textContent = '☑ Select';
+  tile.querySelector('.copy-selected-btn').style.display = 'none';
+  tile.querySelector('.cancel-select-btn').style.display = 'none';
+}
+
+function onSelectRowClick(e) {
+  // Don't fire if clicking inside input or buttons
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON') return;
+  const row = e.currentTarget;
+  const idx = +row.dataset.selIdx;
+  if (selectedIndices.has(idx)) {
+    selectedIndices.delete(idx);
+    row.classList.remove('selected');
+  } else {
+    selectedIndices.add(idx);
+    row.classList.add('selected');
+  }
+  updateSelCount(selectModeKey);
+}
+
+function updateSelCount(dateKey) {
+  const tile = document.querySelector(`.day-tile[data-datekey="${dateKey}"]`);
+  if (!tile) return;
+  const count = selectedIndices.size;
+  const span = tile.querySelector('.sel-count');
+  if (span) span.textContent = count;
+  const copySelBtn = tile.querySelector('.copy-selected-btn');
+  copySelBtn.style.opacity = count > 0 ? '1' : '0.4';
+  copySelBtn.style.pointerEvents = count > 0 ? '' : 'none';
+}
+
 function bindTileActions() {
+  // Select mode
+  document.querySelectorAll('.select-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const key = btn.dataset.key;
+      if (selectModeKey === key) exitSelectMode(key);
+      else enterSelectMode(key);
+    });
+  });
+
+  // Copy selected
+  document.querySelectorAll('.copy-selected-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const key = btn.dataset.key;
+      if (selectedIndices.size === 0) return;
+      const d = loadData();
+      const tasks = d[key] || [];
+      // Get selected tasks in their original order
+      const sorted = Array.from(selectedIndices).sort((a,b) => a - b);
+      copiedSelected = { tasks: sorted.map(i => JSON.parse(JSON.stringify(tasks[i]))) };
+      exitSelectMode(key);
+      updatePasteBtns();
+      showToast(`⎘ ${copiedSelected.tasks.length} task${copiedSelected.tasks.length > 1 ? 's' : ''} copied! Click Append on any date.`);
+    });
+  });
+
+  // Cancel select
+  document.querySelectorAll('.cancel-select-btn').forEach(btn => {
+    btn.addEventListener('click', () => exitSelectMode(btn.dataset.key));
+  });
+
+  // Append paste (selected tasks → appended at bottom)
+  document.querySelectorAll('.append-paste-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      if (!copiedSelected) return;
+      const key = btn.dataset.key;
+      const d = loadData();
+      pushHistory(key, d[key] || []);
+      d[key] = d[key] || [];
+      copiedSelected.tasks.forEach(t => d[key].push(JSON.parse(JSON.stringify(t))));
+      saveDate(key, d[key]);
+      const parts = key.split('-').map(Number);
+      const locked = isPast(parts[0], parts[1]-1, parts[2]) && !globalUnlocked;
+      renderTasks(key, d[key], locked);
+      showToast(`📋 ${copiedSelected.tasks.length} task${copiedSelected.tasks.length > 1 ? 's' : ''} appended!`);
+    });
+  });
+
   // Add task
   document.querySelectorAll('.add-btn').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -1107,6 +1245,9 @@ function bindTileActions() {
 function updatePasteBtns() {
   document.querySelectorAll('.paste-btn').forEach(btn => {
     btn.style.display = copiedData ? '' : 'none';
+  });
+  document.querySelectorAll('.append-paste-btn').forEach(btn => {
+    btn.style.display = copiedSelected ? '' : 'none';
   });
 }
 
