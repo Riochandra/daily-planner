@@ -1134,7 +1134,8 @@ function bindTileActions() {
       const key = btn.dataset.key;
       const d = loadData();
       pushHistory(key, d[key] || []);
-      d[key] = d[key] || [];
+      // Strip empty rows first so appended tasks fill from top
+      d[key] = (d[key] || []).filter(t => t.text.trim() !== '' || t.done);
       copiedSelected.tasks.forEach(t => d[key].push(JSON.parse(JSON.stringify(t))));
       saveDate(key, d[key]);
       const parts = key.split('-').map(Number);
