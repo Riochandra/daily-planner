@@ -889,9 +889,10 @@ function render() {
     const dateKey = getDateKey(currentYear, currentMonth, d);
     const locked = isPast(currentYear, currentMonth, d) && !globalUnlocked;
     const today = isToday(currentYear, currentMonth, d);
-    const tasks = data[dateKey] || Array.from({length: DEFAULT_TASKS}, () => ({text:'', done:false}));
-    while (tasks.length < DEFAULT_TASKS) tasks.push({text:'',done:false});
-    data[dateKey] = tasks;
+    const tasks = data[dateKey] || [];
+    // Pad only for display — never save padded empty rows to storage
+    const displayTasks = [...tasks];
+    while (displayTasks.length < DEFAULT_TASKS) displayTasks.push({text:'',done:false});
 
     const tile = document.createElement('div');
     tile.className = 'day-tile' + (locked ? ' locked' : '') + (today ? ' today' : '');
@@ -922,10 +923,9 @@ function render() {
       </div>
     `;
     container.appendChild(tile);
-    renderTasks(dateKey, tasks, locked);
+    renderTasks(dateKey, displayTasks, locked);
   }
 
-  saveLocalData(data); // persist padded structure locally only, no Firestore push
   bindTileActions();
   updatePasteBtns();
   updateLockChip();
@@ -1134,8 +1134,7 @@ function bindTileActions() {
       const key = btn.dataset.key;
       const d = loadData();
       pushHistory(key, d[key] || []);
-      // Strip empty rows first so appended tasks fill from top
-      d[key] = (d[key] || []).filter(t => t.text.trim() !== '' || t.done);
+      d[key] = d[key] || [];
       copiedSelected.tasks.forEach(t => d[key].push(JSON.parse(JSON.stringify(t))));
       saveDate(key, d[key]);
       const parts = key.split('-').map(Number);
